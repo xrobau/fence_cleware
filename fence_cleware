@@ -3,12 +3,12 @@
 # Source: https://github.com/xrobau/fence_cleware
 # Copyright: GPLv3+
 
-import sys, re, os
+import sys, re, os, subprocess, shlex, threading
 import atexit
 from pipes import quote
 sys.path.append("/usr/share/fence")
 from fencing import *
-from fencing import SUDO_PATH, fail_usage, is_executable, run_command, run_delay
+
 
 #BEGIN_VERSION_GENERATION
 RELEASE_VERSION="1.0.1"
@@ -16,38 +16,62 @@ BUILD_DATE="2015-10-03"
 REDHAT_COPYRIGHT="GPLv3+"
 #END_VERSION_GENERATION
 
+def is_executable(path):
+	return os.access(path, os.X_OK)  
+
+def run_command(options, command, timeout=None, env=None):
+	if timeout is None and "--power-timeout" in options:
+		timeout = options["--power-timeout"]
+	if timeout is not None:
+		timeout = float(timeout)
+
+	try:
+		process = subprocess.Popen(shlex.split(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+	except OSError:
+		fail_usage("Unable to run %s\n" % command)
+
+	thread = threading.Thread(target=process.wait)
+	thread.start()
+	thread.join(timeout)
+	if thread.is_alive():
+		process.kill()
+		fail(EC_TIMED_OUT)
+
+	status = process.wait()
+
+	(pipe_stdout, pipe_stderr) = process.communicate()
+	process.stdout.close()
+	process.stderr.close()
+
+	return (status, pipe_stdout, pipe_stderr)
+
+
 def get_power_status(_, options):
 	output = run_command(options, create_command(options, "status"))
-	match = re.search('Status:[\\s]*([a-zA-Z]{2,3})', str(output))
-	status = match.group(1) if match else None
-	if status == "On":
+	if output[1][:1] == "1":
 		return "on"
-	if status == "Off":
+	if output[1][:1] == "0":
 		return "off"
-	return 3
+	return None
 
 def set_power_status(_, options):
-	run_command(options, create_command(options, options["--action"]))
+	run_command(options, create_command(options, options["-o"]))
 	return
 
-def reboot_cycle(_, options):
-	output = run_command(options, create_command(options, "cycle"))
-	return bool(re.search('chassis power control: cycle', str(output).lower()))
-
 def create_command(options, action):
-	cmd = options["--cleware-path"]
+	cmd = options["-c"]
 
 	# --serial
-	if options.has_key("--serial") and len(options["--serial"]) != 0:
-		cmd += " -d " + quote(options["--serial"]) + " -c 1"
+	if options.has_key("-s") and len(options["-s"]) != 0:
+		cmd += " -n " + quote(options["-s"])
 
 	# --action
 	if action == "off":
-		cmd += " -as 0 0"
+		cmd += " 0"
 	elif action == "on":
-		cmd += " -as 0 1"
+		cmd += " 1"
 	elif action == "status":
-		cmd += " -rs 0"
+		cmd += " -r"
 
 	return cmd
 
@@ -61,38 +85,47 @@ def define_new_opts():
 		"default" : "0",
 		"order": 1
 	}
-	all_opt["cleware_path"] = {
+	all_opt["cleware-path"] = {
 		"getopt" : "c:",
 		"longopt" : "cleware-path",
-		"help" : "--cleware-path=[path]          Path to clewarecontrol binary",
+		"help" : "--cleware-path=[path]          Path to clewareswitch binary",
 		"required" : "0",
-		"shortdesc" : "Path to clewarecontrol binary",
-		"default" : "/usr/bin/clewarecontrol",
+		"shortdesc" : "Path to clewareswitch binary",
+		"default" : "/usr/sbin/clewareswitch",
 		"order": 200
 	}
 
 def main():
+
+	#device_opt = ["help", "version", "agent", "quiet", "verbose", "debug",
+	#		"serial", "cleware_path", "login", "password",
+	#		"no_password", "no_login"]
+
+	device_opt = [  "help", "version", "agent", "quiet", "verbose", "debug",
+			"action", "serial", "cleware-path", "no_login", "no_password",
+			"power_timeout", "shell_timeout", "login_timeout", "power_wait",
+			"test" ]
+
+	all_opt["power_wait"]["default"] = 5
+
 	atexit.register(atexit_handler)
 
-	device_opt = ["serial", "cleware_path", "no_password", "no_login"]
 	define_new_opts()
 
 	options = check_input(device_opt, process_input(device_opt))
 
-	docs = {}
+	docs = { }
 	docs["shortdesc"] = "Fence agent for Cleware Power Switch"
 	docs["longdesc"] = "fence_cleware is a Power Fencing agent\
 which is used with Cleware USB Switches.  This agent requires the support\
-software clewarecontrol (https://github.com/xrobau/clewarecontrol)."
-	docs["vendorurl"] = ""
+software clewareswitch."
+	docs["vendorurl"] = "https://github.com/xrobau/fence_cleware"
 	show_docs(options, docs)
 
-	run_delay(options)
+	if not is_executable(options["-c"]):
+		fail_usage("clewareswitch not found or not accessible")
 
-	if not is_executable(options["--cleware-path"]):
-		fail_usage("clewarecontrol not found or not accessible")
-
-	result = fence_action(None, options, set_power_status, get_power_status, None, reboot_cycle)
+	result = fence_action(None, options, set_power_status, get_power_status, None)
 	sys.exit(result)
 
 if __name__ == "__main__":
